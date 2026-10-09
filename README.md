@@ -29,6 +29,18 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
+## Run with Docker
+
+Compose builds from the GitHub repository, so the Dockerfile must be present
+in the remote branch:
+
+```sh
+docker compose up --build
+```
+
+Open <http://localhost:8501> to use the app. Stop with `Ctrl+C`, or run
+`docker compose down`.
+
 ## Calculation assumptions
 
 - The annual rate is fixed and nominal; it is divided by 12 to calculate

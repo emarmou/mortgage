@@ -1,0 +1,7 @@
+services:
+  mortgage:
+    build:
+      context: https://github.com/emarmou/mortgage.git
+      dockerfile: Dockerfile
+    ports:
+      - "8501:8501"
