@@ -9,6 +9,12 @@ x-axis, and hovering over an individual mortgage point shows its month number.
 A thicker total-balance curve sums all mortgage balances over their combined
 scheduled dates.
 
+## Demo
+
+Illustrative sample inputs for two mortgage scenarios and personal savings:
+
+![Mortgage calculator comparing sample mortgage scenarios and personal savings](demo.png)
+
 All mortgage scenarios are saved locally in `mortgage_inputs.json` and restored
 on the next app launch. This file is shared by app sessions on the machine
 running Streamlit. Existing single-mortgage save files are migrated
