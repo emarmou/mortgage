@@ -2,6 +2,7 @@
 
 import colorsys
 import datetime
+import math
 from pathlib import Path
 from uuid import uuid4
 
@@ -9,8 +10,12 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from mortgage import (
+    PartialRepayment,
+    SavingsGrowthChange,
+    calculate_savings_balance,
+    calculate_repayment_schedule,
     calculate_savings_curve,
-    calculate_schedule,
+    repayment_month_index,
     schedule_dates,
     sum_balance_curves,
 )
@@ -44,6 +49,32 @@ def _mortgage_color(color_index: int) -> str:
     return f"#{round(red * 255):02x}{round(green * 255):02x}{round(blue * 255):02x}"
 
 
+def _savings_growth_changes(
+    mortgages: tuple[MortgageInputs, ...],
+    repayments: tuple[PartialRepayment, ...],
+) -> tuple[SavingsGrowthChange, ...]:
+    changes = []
+    for mortgage in mortgages:
+        schedule = calculate_repayment_schedule(
+            mortgage.principal,
+            mortgage.annual_rate,
+            mortgage.duration_months,
+            mortgage.start_date,
+            (
+                repayment
+                for repayment in repayments
+                if repayment.mortgage_id == mortgage.id
+            ),
+        )
+        dates = schedule_dates(mortgage.start_date, mortgage.duration_months)
+        changes.extend(
+            SavingsGrowthChange(dates[month_index], monthly_amount_change)
+            for month_index, monthly_amount_change
+            in schedule.monthly_payment_changes
+        )
+    return tuple(changes)
+
+
 st.set_page_config(page_title="Mortgage calculator", page_icon="🏠", layout="wide")
 st.title("Mortgage calculator")
 st.write(
@@ -58,6 +89,7 @@ except UserInputStorageError as error:
     st.stop()
 
 saved_mortgages = saved_inputs.mortgages
+repayments = list(saved_inputs.repayments)
 mortgages = []
 remove_id = None
 for mortgage in saved_mortgages:
@@ -119,13 +151,30 @@ for mortgage in saved_mortgages:
         )
 
         metric_col, interest_col, remove_col = st.columns([2, 2, 1])
-        schedule = calculate_schedule(principal, annual_rate, duration_months)
-        metric_col.metric("Monthly payment", f"{schedule.monthly_payment:,.2f}")
-        interest_col.metric("Total interest", f"{schedule.total_interest:,.2f}")
+        try:
+            schedule = calculate_repayment_schedule(
+                principal,
+                annual_rate,
+                duration_months,
+                start_date,
+                (
+                    repayment
+                    for repayment in repayments
+                    if repayment.mortgage_id == mortgage.id
+                ),
+            )
+        except ValueError:
+            metric_col.caption("Schedule unavailable until repayments are corrected.")
+        else:
+            metric_col.metric(
+                "First monthly payment", f"{schedule.monthly_payment:,.2f}"
+            )
+            interest_col.metric("Projected interest", f"{schedule.total_interest:,.2f}")
         if remove_col.button(
             "Remove mortgage",
             key=f"{mortgage.id}_remove",
             disabled=len(saved_mortgages) == 1,
+            help="Also removes partial repayments linked to this mortgage.",
         ):
             remove_id = mortgage.id
 
@@ -145,6 +194,11 @@ if add_requested:
 
 if remove_id is not None:
     mortgages = [mortgage for mortgage in mortgages if mortgage.id != remove_id]
+    repayments = [
+        repayment
+        for repayment in repayments
+        if repayment.mortgage_id != remove_id
+    ]
 
 latest_mortgage_end = max(
     schedule_dates(mortgage.start_date, mortgage.duration_months)[-1]
@@ -183,23 +237,380 @@ savings = PersonalSavings(
     start_date=savings_start_date,
     monthly_amount=monthly_savings,
 )
+
+st.subheader("Partial mortgage repayments")
+remove_repayment_id = None
+if repayments:
+    updated_repayments = []
+    for repayment in repayments:
+        mortgage = next(
+            mortgage
+            for mortgage in mortgages
+            if mortgage.id == repayment.mortgage_id
+        )
+        try:
+            effective_index = repayment_month_index(
+                mortgage.start_date,
+                mortgage.duration_months,
+                repayment.repayment_date,
+            )
+        except ValueError:
+            effective_date_label = "outside the mortgage term"
+            payment_label = "schedule unavailable"
+        else:
+            effective_date = schedule_dates(
+                mortgage.start_date, mortgage.duration_months
+            )[effective_index]
+            effective_date_label = f"applied {effective_date:%b %d, %Y}"
+            try:
+                repayment_schedule = calculate_repayment_schedule(
+                    mortgage.principal,
+                    mortgage.annual_rate,
+                    mortgage.duration_months,
+                    mortgage.start_date,
+                    (
+                        saved_repayment
+                        for saved_repayment in repayments
+                        if saved_repayment.mortgage_id == mortgage.id
+                    ),
+                )
+            except ValueError:
+                payment_label = "schedule unavailable"
+            else:
+                if effective_index < mortgage.duration_months:
+                    next_payment = repayment_schedule.monthly_payments[
+                        effective_index
+                    ]
+                    payment_label = f"next payment {next_payment:,.2f}"
+                else:
+                    payment_label = "no remaining scheduled payments"
+        adjustment_label = (
+            "Keep monthly payment; shorten term"
+            if repayment.adjustment == "keep_payment"
+            else "Keep original end date; reduce payment"
+        )
+        other_personal_repayments = tuple(
+            saved_repayment
+            for saved_repayment in repayments
+            if saved_repayment.id != repayment.id
+            and saved_repayment.funding_source == "personal_savings"
+        )
+        can_use_personal_savings = repayment.funding_source == "personal_savings"
+        if not can_use_personal_savings:
+            try:
+                available_for_repayment = calculate_savings_balance(
+                    savings.current_total,
+                    savings.monthly_amount,
+                    savings.start_date,
+                    repayment.repayment_date,
+                    other_personal_repayments,
+                )
+            except ValueError:
+                available_for_repayment = 0.0
+            can_use_personal_savings = (
+                repayment.amount <= available_for_repayment + 1e-8
+            )
+        funding_options = ("external_fund", "personal_savings")
+        if not can_use_personal_savings:
+            funding_options = ("external_fund",)
+        with st.container(border=True):
+            repayment_col, source_col, remove_col = st.columns([5, 2, 1])
+            repayment_col.write(
+                f"**{mortgage.name}** — {repayment.amount:,.2f} on "
+                f"{repayment.repayment_date:%b %d, %Y} "
+                f"({effective_date_label}); {adjustment_label}; {payment_label}"
+            )
+            funding_source = source_col.selectbox(
+                "Funding source",
+                options=funding_options,
+                index=0 if repayment.funding_source == "external_fund" else 1,
+                format_func=lambda source: (
+                    "Personal savings"
+                    if source == "personal_savings"
+                    else "External fund"
+                ),
+                key=f"{repayment.id}_funding_source",
+            )
+            if funding_source != repayment.funding_source:
+                repayment = PartialRepayment(
+                    id=repayment.id,
+                    mortgage_id=repayment.mortgage_id,
+                    repayment_date=repayment.repayment_date,
+                    amount=repayment.amount,
+                    adjustment=repayment.adjustment,
+                    funding_source=funding_source,
+                )
+            updated_repayments.append(repayment)
+            if remove_col.button("Remove", key=f"{repayment.id}_remove"):
+                remove_repayment_id = repayment.id
+    repayments = [
+        repayment
+        for repayment in updated_repayments
+        if repayment.id != remove_repayment_id
+    ]
+else:
+    st.caption("No partial repayments have been added.")
+
+personal_repayments = tuple(
+    repayment
+    for repayment in repayments
+    if repayment.funding_source == "personal_savings"
+)
 try:
-    save_inputs(INPUTS_FILE, tuple(mortgages), savings)
+    growth_changes = _savings_growth_changes(tuple(mortgages), tuple(repayments))
+except ValueError as error:
+    st.error(f"Cannot calculate savings growth from mortgage repayments: {error}")
+    st.stop()
+personal_repayments_by_date = {}
+for repayment in personal_repayments:
+    personal_repayments_by_date.setdefault(repayment.repayment_date, []).append(
+        repayment
+    )
+for repayment_date, date_repayments in personal_repayments_by_date.items():
+    earlier_repayments = tuple(
+        repayment
+        for repayment in personal_repayments
+        if repayment.repayment_date < repayment_date
+    )
+    try:
+        available_before = calculate_savings_balance(
+            savings.current_total,
+            savings.monthly_amount,
+            savings.start_date,
+            repayment_date,
+            earlier_repayments,
+            growth_changes,
+        )
+    except ValueError as error:
+        st.error(f"Cannot validate personal savings-funded repayments: {error}")
+        continue
+    total_debit = sum(repayment.amount for repayment in date_repayments)
+    if total_debit > available_before + 1e-8:
+        st.error(
+            f"Personal savings are insufficient for repayments on "
+            f"{repayment_date:%b %d, %Y}: {total_debit:,.2f} due, "
+            f"{available_before:,.2f} available. Increase the savings input, "
+            "remove a repayment, or change its funding source."
+        )
+
+add_repayment_requested = False
+if mortgages:
+    mortgage_by_id = {mortgage.id: mortgage for mortgage in mortgages}
+    mortgage_name_counts = {}
+    for mortgage in mortgages:
+        mortgage_name_counts[mortgage.name] = (
+            mortgage_name_counts.get(mortgage.name, 0) + 1
+        )
+    mortgage_labels = {
+        mortgage.id: (
+            mortgage.name
+            if mortgage_name_counts[mortgage.name] == 1
+            else f"{mortgage.name} ({mortgage.id[:8]})"
+        )
+        for mortgage in mortgages
+    }
+    repayment_cols = st.columns(3)
+    with repayment_cols[0]:
+        target_mortgage_id = st.selectbox(
+            "Target mortgage",
+            options=list(mortgage_by_id),
+            format_func=lambda mortgage_id: mortgage_labels[mortgage_id],
+            key="repayment_target",
+        )
+    with repayment_cols[1]:
+        funding_source = st.selectbox(
+            "Funding source",
+            options=("external_fund", "personal_savings"),
+            format_func=lambda source: (
+                "Personal savings" if source == "personal_savings" else "External fund"
+            ),
+            key="repayment_funding_source",
+        )
+    target_mortgage = mortgage_by_id[target_mortgage_id]
+    mortgage_end_date = schedule_dates(
+        target_mortgage.start_date, target_mortgage.duration_months
+    )[-1]
+    today = datetime.datetime.now().astimezone().date()
+    default_repayment_date = min(
+        max(today, target_mortgage.start_date), mortgage_end_date
+    )
+    earliest_repayment_date = target_mortgage.start_date
+    if funding_source == "personal_savings":
+        earliest_repayment_date = max(
+            earliest_repayment_date, savings.start_date
+        )
+    repayment_date_is_valid = earliest_repayment_date <= mortgage_end_date
+    if repayment_date_is_valid:
+        default_repayment_date = min(
+            max(default_repayment_date, earliest_repayment_date),
+            mortgage_end_date,
+        )
+        with repayment_cols[2]:
+            repayment_date = st.date_input(
+                "Repayment date",
+                value=default_repayment_date,
+                min_value=earliest_repayment_date,
+                max_value=mortgage_end_date,
+                key=(
+                    f"repayment_date_{target_mortgage.id}_{funding_source}_"
+                    f"{target_mortgage.start_date}_{target_mortgage.duration_months}"
+                ),
+                help="Savings are debited on this date. The mortgage repayment "
+                "is applied after the installment on the next scheduled date.",
+            )
+    else:
+        repayment_date = mortgage_end_date
+        with repayment_cols[2]:
+            st.info(
+                "Savings start after this mortgage ends. Choose an external fund."
+            )
+    target_repayments = tuple(
+        repayment
+        for repayment in repayments
+        if repayment.mortgage_id == target_mortgage.id
+    )
+    try:
+        target_schedule = calculate_repayment_schedule(
+            target_mortgage.principal,
+            target_mortgage.annual_rate,
+            target_mortgage.duration_months,
+            target_mortgage.start_date,
+            target_repayments,
+        )
+        repayment_month = repayment_month_index(
+            target_mortgage.start_date,
+            target_mortgage.duration_months,
+            repayment_date,
+        )
+        remaining_balance = target_schedule.balances[repayment_month]
+    except ValueError as error:
+        st.error(
+            f"{target_mortgage.name} has an invalid repayment schedule: {error} "
+            "Remove or re-enter the affected repayment before adding another."
+        )
+        remaining_balance = 0.0
+        target_schedule = None
+
+    savings_available = math.inf
+    if funding_source == "personal_savings" and repayment_date_is_valid:
+        try:
+            savings_available = calculate_savings_balance(
+                savings.current_total,
+                savings.monthly_amount,
+                savings.start_date,
+                repayment_date,
+                personal_repayments,
+                growth_changes,
+            )
+        except ValueError as error:
+            st.error(f"Cannot calculate available personal savings: {error}")
+            savings_available = 0.0
+    amount_limit = min(remaining_balance, savings_available)
+    max_repayment_amount = math.floor((amount_limit + 1e-8) * 100) / 100
+    can_add_repayment = (
+        repayment_date_is_valid
+        and max_repayment_amount >= 0.01
+        and target_schedule is not None
+    )
+    amount_cols = st.columns(2)
+    with amount_cols[0]:
+        if can_add_repayment:
+            repayment_amount = st.number_input(
+                "Amount",
+                min_value=0.01,
+                max_value=max_repayment_amount,
+                value=min(1_000.0, max_repayment_amount),
+                step=100.0,
+                format="%.2f",
+                key=(
+                    f"repayment_amount_{target_mortgage.id}_{repayment_date}_"
+                    f"{max_repayment_amount:.2f}"
+                ),
+                help=(
+                    "Capped by the mortgage balance at its application date "
+                    "and the available funding source."
+                ),
+            )
+        else:
+            if target_schedule is not None and repayment_date_is_valid:
+                if remaining_balance < 0.01:
+                    st.info("No remaining mortgage balance is available.")
+                elif funding_source == "personal_savings":
+                    st.info("No personal savings are available for this repayment.")
+            repayment_amount = 0.0
+    with amount_cols[1]:
+        adjustment = st.selectbox(
+            "After repayment",
+            options=("keep_payment", "keep_end_date"),
+            format_func=lambda choice: (
+                "Keep payment; shorten term"
+                if choice == "keep_payment"
+                else "Keep end date; reduce payment"
+            ),
+            key="repayment_adjustment",
+        )
+    if st.button("Add partial repayment", disabled=not can_add_repayment):
+        new_repayment = PartialRepayment(
+            id=uuid4().hex,
+            mortgage_id=target_mortgage.id,
+            repayment_date=repayment_date,
+            amount=repayment_amount,
+            adjustment=adjustment,
+            funding_source=funding_source,
+        )
+        try:
+            calculate_repayment_schedule(
+                target_mortgage.principal,
+                target_mortgage.annual_rate,
+                target_mortgage.duration_months,
+                target_mortgage.start_date,
+                (*target_repayments, new_repayment),
+            )
+        except ValueError as error:
+            st.error(f"Could not add partial repayment: {error}")
+        else:
+            repayments.append(new_repayment)
+            add_repayment_requested = True
+
+try:
+    save_inputs(INPUTS_FILE, tuple(mortgages), savings, tuple(repayments))
 except UserInputStorageError as error:
     st.error(str(error))
     st.stop()
-if add_requested or remove_id is not None:
+if (
+    add_requested
+    or remove_id is not None
+    or remove_repayment_id is not None
+    or add_repayment_requested
+):
     st.rerun()
 st.caption("All mortgage inputs are saved locally on this machine.")
+
+projected_schedules = {}
+for mortgage in mortgages:
+    try:
+        projected_schedules[mortgage.id] = calculate_repayment_schedule(
+            mortgage.principal,
+            mortgage.annual_rate,
+            mortgage.duration_months,
+            mortgage.start_date,
+            (
+                repayment
+                for repayment in repayments
+                if repayment.mortgage_id == mortgage.id
+            ),
+        )
+    except ValueError as error:
+        st.error(
+            f"Cannot project {mortgage.name}: {error} "
+            "Remove or re-enter the affected repayment."
+        )
+        st.stop()
 
 figure = go.Figure()
 balance_curves = []
 for scenario_index, mortgage in enumerate(mortgages):
-    schedule = calculate_schedule(
-        mortgage.principal,
-        mortgage.annual_rate,
-        mortgage.duration_months,
-    )
+    schedule = projected_schedules[mortgage.id]
     dates = schedule_dates(mortgage.start_date, mortgage.duration_months)
     balance_curves.append((dates, schedule.balances))
     months = list(range(mortgage.duration_months + 1))
@@ -236,12 +647,18 @@ if total_dates:
         )
     )
 
-savings_dates, savings_balances = calculate_savings_curve(
-    savings.current_total,
-    savings.monthly_amount,
-    savings.start_date,
-    latest_mortgage_end,
-)
+try:
+    savings_dates, savings_balances = calculate_savings_curve(
+        savings.current_total,
+        savings.monthly_amount,
+        savings.start_date,
+        latest_mortgage_end,
+        repayments,
+        growth_changes,
+    )
+except ValueError as error:
+    st.error(f"Cannot calculate the personal savings curve: {error}")
+    st.stop()
 if savings_dates:
     figure.add_trace(
         go.Scatter(
@@ -285,10 +702,11 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
-st.plotly_chart(figure, use_container_width=True)
+st.plotly_chart(figure, width="stretch")
 st.caption(
     "Assumes a fixed rate and equal monthly payments, with interest calculated "
-    "monthly. Savings start at the current total and increase on monthly "
-    "anniversaries. The savings curve ends at the latest mortgage end date. "
-    "Fees, taxes, insurance, and payment rounding are not included."
+    "monthly. Savings increase on monthly anniversaries, including payment "
+    "reductions and payments freed after an early payoff. The savings curve "
+    "ends at the latest mortgage end date. Fees, taxes, insurance, and payment "
+    "rounding are not included."
 )

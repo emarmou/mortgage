@@ -8,6 +8,8 @@ import os
 from pathlib import Path
 import tempfile
 
+from mortgage import PartialRepayment
+
 
 class UserInputStorageError(Exception):
     """Raised when saved mortgage inputs cannot be read or written."""
@@ -34,6 +36,7 @@ class PersonalSavings:
 class CalculatorInputs:
     mortgages: tuple[MortgageInputs, ...]
     savings: PersonalSavings
+    repayments: tuple[PartialRepayment, ...] = ()
 
 
 def load_inputs(
@@ -52,12 +55,15 @@ def load_inputs(
     if isinstance(data, dict) and "mortgages" in data:
         records = data["mortgages"]
         savings_data = data.get("savings", _serialize_savings(default_savings))
+        repayment_records = data.get("repayments", [])
     elif isinstance(data, dict):
         records = [{"id": "mortgage-1", "name": "Mortgage 1", **data}]
         savings_data = _serialize_savings(default_savings)
+        repayment_records = []
     elif isinstance(data, list):
         records = data
         savings_data = _serialize_savings(default_savings)
+        repayment_records = []
     else:
         raise UserInputStorageError(
             "Saved inputs are invalid: expected a mortgage list or calculator object."
@@ -71,9 +77,18 @@ def load_inputs(
         ids = [mortgage.id for mortgage in mortgages]
         if len(ids) != len(set(ids)):
             raise ValueError("mortgage IDs must be unique")
+        repayments = tuple(
+            _parse_repayment(record) for record in repayment_records
+        )
+        repayment_ids = [repayment.id for repayment in repayments]
+        if len(repayment_ids) != len(set(repayment_ids)):
+            raise ValueError("repayment IDs must be unique")
+        mortgage_ids = set(ids)
+        if any(repayment.mortgage_id not in mortgage_ids for repayment in repayments):
+            raise ValueError("each repayment must target a saved mortgage")
     except (KeyError, TypeError, ValueError, OverflowError) as error:
         raise UserInputStorageError(f"Saved inputs are invalid: {error}") from error
-    return CalculatorInputs(mortgages, savings)
+    return CalculatorInputs(mortgages, savings, repayments)
 
 
 def _parse_savings(data: object) -> PersonalSavings:
@@ -156,6 +171,48 @@ def _parse_mortgage(data: object) -> MortgageInputs:
     )
 
 
+def _parse_repayment(data: object) -> PartialRepayment:
+    if not isinstance(data, dict):
+        raise ValueError("each repayment must be a JSON object")
+
+    repayment_id = data["id"]
+    mortgage_id = data["mortgage_id"]
+    repayment_date_text = data["repayment_date"]
+    amount = data["amount"]
+    adjustment = data["adjustment"]
+
+    if not isinstance(repayment_id, str) or not repayment_id:
+        raise ValueError("repayment id must be a non-empty string")
+    if not isinstance(mortgage_id, str) or not mortgage_id:
+        raise ValueError("repayment mortgage_id must be a non-empty string")
+    if (
+        isinstance(amount, bool)
+        or not isinstance(amount, (int, float))
+        or not math.isfinite(amount)
+        or amount <= 0
+    ):
+        raise ValueError("repayment amount must be a finite number greater than zero")
+    if not isinstance(repayment_date_text, str):
+        raise ValueError("repayment_date must be an ISO date string")
+    repayment_date = date.fromisoformat(repayment_date_text)
+    if repayment_date.isoformat() != repayment_date_text:
+        raise ValueError("repayment_date must use YYYY-MM-DD format")
+    if adjustment not in ("keep_payment", "keep_end_date"):
+        raise ValueError("repayment adjustment is invalid")
+    funding_source = data.get("funding_source", "external_fund")
+    if funding_source not in ("personal_savings", "external_fund"):
+        raise ValueError("repayment funding_source is invalid")
+
+    return PartialRepayment(
+        id=repayment_id,
+        mortgage_id=mortgage_id,
+        repayment_date=repayment_date,
+        amount=float(amount),
+        adjustment=adjustment,
+        funding_source=funding_source,
+    )
+
+
 def _serialize_savings(savings: PersonalSavings) -> dict[str, object]:
     return {
         "current_total": savings.current_total,
@@ -168,8 +225,9 @@ def save_inputs(
     path: Path,
     mortgages: tuple[MortgageInputs, ...],
     savings: PersonalSavings,
+    repayments: tuple[PartialRepayment, ...] = (),
 ) -> None:
-    """Atomically save every mortgage and personal savings input locally."""
+    """Atomically save mortgage, savings, and repayment inputs locally."""
     temporary_path = None
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -195,6 +253,17 @@ def save_inputs(
                     for mortgage in mortgages
                 ],
                 "savings": _serialize_savings(savings),
+                "repayments": [
+                    {
+                        "id": repayment.id,
+                        "mortgage_id": repayment.mortgage_id,
+                        "repayment_date": repayment.repayment_date.isoformat(),
+                        "amount": repayment.amount,
+                        "adjustment": repayment.adjustment,
+                        "funding_source": repayment.funding_source,
+                    }
+                    for repayment in repayments
+                ],
             }
             json.dump(data, temporary_file, indent=2)
             temporary_file.write("\n")
